@@ -282,6 +282,10 @@ using VehicleSetVisibilityFn = void(__thiscall*)(void*, void*, int, int, int);
 VehicleSetVisibilityFn g_originalVehicleSetVisibility = nullptr;
 void** g_vehicleSetVisibilitySlot = nullptr;
 std::atomic<bool> g_vehicleVisibilityOverrideLogged = false;
+std::atomic<bool> g_cameraVisibilityMetadataOverrideLogged = false;
+std::atomic<bool> g_cameraVisibilityMetadataLookupFailureLogged = false;
+std::atomic<bool> g_cameraReflectionOffsetsLogged = false;
+std::atomic<void*> g_trackManiaGame = nullptr;
 std::atomic<bool> g_horizonLockLogged = false;
 std::atomic<bool> g_vrDisabledForIncompatibleGraphics = false;
 std::atomic<bool> g_incompatibleGraphicsWarningShown = false;
@@ -297,6 +301,163 @@ bool IsReadableRange(const void* address, size_t size) {
     const uintptr_t start = reinterpret_cast<uintptr_t>(address);
     const uintptr_t end = reinterpret_cast<uintptr_t>(memory.BaseAddress) + memory.RegionSize;
     return start <= end && size <= end - start;
+}
+
+bool IsWritableRange(void* address, size_t size) {
+    if (!address || !size) return false;
+    MEMORY_BASIC_INFORMATION memory{};
+    if (!VirtualQuery(address, &memory, sizeof(memory)) || memory.State != MEM_COMMIT) return false;
+    if ((memory.Protect & (PAGE_GUARD | PAGE_NOACCESS)) != 0) return false;
+    const DWORD access = memory.Protect & 0xff;
+    if (access != PAGE_READWRITE && access != PAGE_WRITECOPY &&
+        access != PAGE_EXECUTE_READWRITE && access != PAGE_EXECUTE_WRITECOPY) return false;
+    const uintptr_t start = reinterpret_cast<uintptr_t>(address);
+    const uintptr_t end = reinterpret_cast<uintptr_t>(memory.BaseAddress) + memory.RegionSize;
+    return start <= end && size <= end - start;
+}
+
+template <typename T>
+bool ReadGameValue(const void* owner, size_t offset, T& value) {
+    if (!owner) return false;
+    const auto* address = static_cast<const uint8_t*>(owner) + offset;
+    if (!IsReadableRange(address, sizeof(value))) return false;
+    std::memcpy(&value, address, sizeof(value));
+    return true;
+}
+
+struct GameFastBuffer {
+    void** values = nullptr;
+    uint32_t count = 0;
+    uint32_t capacity = 0;
+};
+
+bool ReadGameFastBuffer(const void* owner, size_t offset, GameFastBuffer& buffer, uint32_t maximumCount) {
+    uint32_t words[3]{};
+    if (!ReadGameValue(owner, offset, words)) return false;
+    const auto accept = [&](uint32_t count, uint32_t pointerWord, uint32_t bookkeeping) {
+        if (count > maximumCount) return false;
+        auto** values = reinterpret_cast<void**>(static_cast<uintptr_t>(pointerWord));
+        if (count != 0 && !IsReadableRange(values, static_cast<size_t>(count) * sizeof(void*))) return false;
+        buffer.values = values;
+        buffer.count = count;
+        buffer.capacity = bookkeeping;
+        return true;
+    };
+    // ModTMNF documents CFastArray as count followed by its data pointer.
+    // CFastBuffer has a third bookkeeping word, but it is not safe to interpret
+    // it as a conventional vector capacity. Buffer variants place the pointer
+    // either immediately after the count or after that bookkeeping word.
+    return accept(words[0], words[1], words[2]) ||
+        accept(words[0], words[2], words[1]) ||
+        accept(words[1], words[0], words[2]);
+}
+
+bool IsExecutableAddress(const void* address) {
+    MEMORY_BASIC_INFORMATION memory{};
+    if (!address || !VirtualQuery(address, &memory, sizeof(memory)) || memory.State != MEM_COMMIT) return false;
+    if ((memory.Protect & (PAGE_GUARD | PAGE_NOACCESS)) != 0) return false;
+    const DWORD access = memory.Protect & 0xff;
+    return access == PAGE_EXECUTE || access == PAGE_EXECUTE_READ ||
+        access == PAGE_EXECUTE_READWRITE || access == PAGE_EXECUTE_WRITECOPY;
+}
+
+bool GameAnsiStringEquals(const char* value, const char* expected) {
+    if (!value || !expected) return false;
+    const size_t length = std::strlen(expected);
+    if (!IsReadableRange(value, length + 1)) return false;
+    return std::memcmp(value, expected, length) == 0 && value[length] == '\0';
+}
+
+size_t MwParamInfoSize(int32_t type) {
+    switch (type) {
+        case 0: return 32;  // Action
+        case 5: return 36;  // Class
+        case 13: return 40; // Enum
+        case 18: case 35: case 40: return 36; // numeric ranges
+        case 49: return 36; // Vec2
+        case 53: return 40; // Vec3
+        case 57: return 44; // Vec4
+        case 65: return 48; // Proc
+        default:
+            // All Array, Buffer, and BufferCat variants occupy 44 bytes.
+            if ((type >= 2 && type <= 4) || (type >= 6 && type <= 8) ||
+                (type >= 10 && type <= 12) || (type >= 15 && type <= 17) ||
+                (type >= 20 && type <= 22) || (type >= 24 && type <= 26) ||
+                (type >= 28 && type <= 30) || (type >= 32 && type <= 34) ||
+                (type >= 37 && type <= 39) || (type >= 42 && type <= 44) ||
+                (type >= 46 && type <= 48) || (type >= 50 && type <= 52) ||
+                (type >= 54 && type <= 56) || (type >= 58 && type <= 60) ||
+                (type >= 62 && type <= 64)) return 44;
+            return 28;
+    }
+}
+
+void* GetMwClassInfo(void* object) {
+    void* vtable = nullptr;
+    void* method = nullptr;
+    if (!ReadGameValue(object, 0, vtable) || !ReadGameValue(vtable, 8, method) ||
+        !IsExecutableAddress(method)) return nullptr;
+    using MwGetClassInfoFn = void*(__thiscall*)(void*);
+    void* classInfo = reinterpret_cast<MwGetClassInfoFn>(method)(object);
+    return IsReadableRange(classInfo, 40) ? classInfo : nullptr;
+}
+
+bool FindReflectedGameOffset(void* object, const char* propertyName, int& offset) {
+    void* classInfo = GetMwClassInfo(object);
+    for (uint32_t depth = 0; classInfo && depth < 32; ++depth) {
+        int32_t paramCount = 0;
+        void* paramInfoSlot = nullptr;
+        if (!ReadGameValue(classInfo, 36, paramCount) || paramCount < 0 || paramCount > 1024 ||
+            !ReadGameValue(classInfo, 32, paramInfoSlot)) return false;
+
+        void* paramInfo = nullptr;
+        if (paramInfoSlot) {
+            ReadGameValue(paramInfoSlot, 0, paramInfo);
+            if (!IsReadableRange(paramInfo, 28) && IsReadableRange(paramInfoSlot, 28)) {
+                // Accommodate builds which store the first descriptor directly.
+                paramInfo = paramInfoSlot;
+            }
+        }
+        auto* cursor = static_cast<uint8_t*>(paramInfo);
+        for (int32_t index = 0; index < paramCount && cursor; ++index) {
+            int32_t type = -1;
+            int32_t memberOffset = -1;
+            const char* name = nullptr;
+            if (!ReadGameValue(cursor, 0, type) || type < 0 || type > 65 ||
+                !ReadGameValue(cursor, 12, memberOffset) || !ReadGameValue(cursor, 16, name)) return false;
+            if (memberOffset >= 0 && GameAnsiStringEquals(name, propertyName)) {
+                offset = memberOffset;
+                return true;
+            }
+            const size_t descriptorSize = MwParamInfoSize(type);
+            if (!IsReadableRange(cursor, descriptorSize)) return false;
+            cursor += descriptorSize;
+        }
+
+        void* parent = nullptr;
+        if (!ReadGameValue(classInfo, 8, parent) || parent == classInfo) return false;
+        classInfo = IsReadableRange(parent, 40) ? parent : nullptr;
+    }
+    return false;
+}
+
+struct CameraReflectionOffsets {
+    std::atomic<int> players{-1};
+    std::atomic<int> cameraSet{-1};
+    std::atomic<int> camerasMaster{-1};
+    std::atomic<int> managedCameras{-1};
+    std::atomic<int> currentCamera{-1};
+    std::atomic<int> isFirstPerson{-1};
+    std::atomic<int> isActive{-1};
+} g_cameraReflectionOffsets;
+
+int ResolveReflectedGameOffset(std::atomic<int>& cached, void* object, const char* propertyName) {
+    const int existing = cached.load(std::memory_order_relaxed);
+    if (existing >= 0) return existing;
+    int reflected = -1;
+    if (!FindReflectedGameOffset(object, propertyName, reflected)) return -1;
+    cached.store(reflected, std::memory_order_relaxed);
+    return reflected;
 }
 
 bool ReadTrackManiaWideString(const void* owner, size_t offset, std::wstring& value) {
@@ -509,6 +670,102 @@ bool CockpitCameraActive() {
         g_cameraSettings.selectedCamera.load(std::memory_order_relaxed) == 3;
 }
 
+void DisableActiveCameraFirstPersonVisibilityMetadata(void* game) {
+    if (!game || !CockpitCameraActive()) return;
+
+    // ModTMNF documents this object chain and the engine's reflection layout:
+    // CGameApp::Players -> CGamePlayer::CameraSet -> CGamePlayerCameraSet::CamsMaster
+    // -> CGameControlCameraMaster::ManagedCams. Resolve every member by name from
+    // the live TMUF object's own CMwClassInfo so Nations offsets are never assumed.
+    // Camera 3's IsFirstPerson metadata asks the vehicle renderer to use its
+    // restricted internal-camera visual set; clearing only that metadata leaves
+    // the actual internal camera object and pose untouched.
+    const int playersOffset = ResolveReflectedGameOffset(
+        g_cameraReflectionOffsets.players, game, "Players");
+    if (playersOffset < 0) {
+        if (!g_cameraVisibilityMetadataLookupFailureLogged.exchange(true)) {
+            tmoxr::log::Warn("Could not reflect CGameApp::Players from the live United game object; retaining the existing vehicle visibility override.");
+        }
+        return;
+    }
+
+    GameFastBuffer players{};
+    if (!ReadGameFastBuffer(game, static_cast<size_t>(playersOffset), players, 8) || players.count == 0) {
+        if (!g_cameraVisibilityMetadataLookupFailureLogged.exchange(true)) {
+            tmoxr::log::Warn("Reflected CGameApp::Players, but its live camera-player buffer was unavailable; retaining the existing vehicle visibility override.");
+        }
+        return;
+    }
+
+    bool resolvedCameraList = false;
+    for (uint32_t playerIndex = 0; playerIndex < players.count; ++playerIndex) {
+        void* player = nullptr;
+        std::memcpy(&player, players.values + playerIndex, sizeof(player));
+        void* cameraSet = nullptr;
+        void* camerasMaster = nullptr;
+        const int cameraSetOffset = ResolveReflectedGameOffset(
+            g_cameraReflectionOffsets.cameraSet, player, "CameraSet");
+        if (cameraSetOffset < 0 ||
+            !ReadGameValue(player, static_cast<size_t>(cameraSetOffset), cameraSet)) continue;
+        const int camerasMasterOffset = ResolveReflectedGameOffset(
+            g_cameraReflectionOffsets.camerasMaster, cameraSet, "CamsMaster");
+        if (camerasMasterOffset < 0 ||
+            !ReadGameValue(cameraSet, static_cast<size_t>(camerasMasterOffset), camerasMaster)) continue;
+
+        GameFastBuffer cameras{};
+        uint32_t currentCamera = UINT32_MAX;
+        const int managedCamerasOffset = ResolveReflectedGameOffset(
+            g_cameraReflectionOffsets.managedCameras, camerasMaster, "ManagedCams");
+        const int currentCameraOffset = ResolveReflectedGameOffset(
+            g_cameraReflectionOffsets.currentCamera, camerasMaster, "CurrentCam");
+        if (managedCamerasOffset < 0 || currentCameraOffset < 0 ||
+            !ReadGameFastBuffer(camerasMaster, static_cast<size_t>(managedCamerasOffset), cameras, 64) ||
+            cameras.count == 0 ||
+            !ReadGameValue(camerasMaster, static_cast<size_t>(currentCameraOffset), currentCamera)) continue;
+        resolvedCameraList = true;
+
+        for (uint32_t cameraIndex = 0; cameraIndex < cameras.count; ++cameraIndex) {
+            void* camera = nullptr;
+            std::memcpy(&camera, cameras.values + cameraIndex, sizeof(camera));
+            int32_t isActive = 0;
+            int32_t isFirstPerson = 0;
+            const int isActiveOffset = ResolveReflectedGameOffset(
+                g_cameraReflectionOffsets.isActive, camera, "IsActive");
+            const int isFirstPersonOffset = ResolveReflectedGameOffset(
+                g_cameraReflectionOffsets.isFirstPerson, camera, "IsFirstPerson");
+            if (isActiveOffset < 0 || isFirstPersonOffset < 0 ||
+                !ReadGameValue(camera, static_cast<size_t>(isActiveOffset), isActive) || !isActive ||
+                !ReadGameValue(camera, static_cast<size_t>(isFirstPersonOffset), isFirstPerson) || !isFirstPerson) continue;
+            auto* firstPersonAddress = static_cast<uint8_t*>(camera) + isFirstPersonOffset;
+            if (!IsWritableRange(firstPersonAddress, sizeof(int32_t))) continue;
+            const int32_t disabled = 0;
+            std::memcpy(firstPersonAddress, &disabled, sizeof(disabled));
+            if (!g_cameraReflectionOffsetsLogged.exchange(true)) {
+                std::ostringstream offsets;
+                offsets << "Resolved live TMUF camera reflection offsets: Players=0x" << std::hex << playersOffset
+                        << ", CameraSet=0x" << cameraSetOffset
+                        << ", CamsMaster=0x" << camerasMasterOffset
+                        << ", ManagedCams=0x" << managedCamerasOffset
+                        << ", CurrentCam=0x" << currentCameraOffset
+                        << ", IsActive=0x" << isActiveOffset
+                        << ", IsFirstPerson=0x" << isFirstPersonOffset << ".";
+                tmoxr::log::Info(offsets.str());
+            }
+            if (!g_cameraVisibilityMetadataOverrideLogged.exchange(true)) {
+                std::ostringstream message;
+                message << "Camera 3 active camera metadata override: cleared IsFirstPerson on managed camera "
+                        << cameraIndex << " (master current camera=" << currentCamera
+                        << ") so TrackMania can render the external vehicle components.";
+                tmoxr::log::Info(message.str());
+            }
+        }
+    }
+
+    if (!resolvedCameraList && !g_cameraVisibilityMetadataLookupFailureLogged.exchange(true)) {
+        tmoxr::log::Warn("Could not resolve TrackMania's active managed camera; retaining the existing vehicle visibility override.");
+    }
+}
+
 void InitializeCameraFromVehicleVisibility(int visible) {
     // Vehicle visibility also changes for non-camera reasons throughout a race,
     // so it is only a safe camera signal while our state is still unknown. A
@@ -523,6 +780,7 @@ void InitializeCameraFromVehicleVisibility(int visible) {
 
 void __fastcall VehicleSetVisibilityHook(void* game, void*, void* vehicleMobil,
                                          int visible, int context, int recursive) {
+    g_trackManiaGame.store(game, std::memory_order_relaxed);
     // Camera input is processed before D3D BeginScene, so sample the shortcut
     // here as well or the first camera-3 hide request can arrive one frame
     // before the renderer has recorded the new camera mode.
@@ -531,6 +789,7 @@ void __fastcall VehicleSetVisibilityHook(void* game, void*, void* vehicleMobil,
     // hide request to initialize an unknown camera state, but never let later
     // visibility churn override an established/manual camera selection.
     if (vehicleMobil) InitializeCameraFromVehicleVisibility(visible);
+    DisableActiveCameraFirstPersonVisibilityMetadata(game);
     // The active challenge belongs to the game object, so any visibility update
     // can safely refresh the environment without inspecting a vehicle instance.
     if (visible == 0) DetectActiveVehicleProfile(game);
@@ -1971,6 +2230,8 @@ HRESULT STDMETHODCALLTYPE BeginSceneHook(IDirect3DDevice9* device) {
     ReloadCameraSettingsIfChanged();
     tmoxr::VrBridge::Instance().OnBeginScene();
     UpdateSelectedCameraFromKeyboard();
+    DisableActiveCameraFirstPersonVisibilityMetadata(
+        g_trackManiaGame.load(std::memory_order_relaxed));
     g_stereo.haveHeadPose = tmoxr::VrBridge::Instance().GetHeadPose(g_stereo.headPose);
     tmoxr::RenderConfiguration renderConfiguration{};
     if (tmoxr::VrBridge::Instance().GetRenderConfiguration(renderConfiguration)) {
